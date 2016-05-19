@@ -20,6 +20,7 @@ from .document import Reader
 from .evaluate import Evaluate
 from .significance import Confidence
 from .interact import embed_shell
+from .utils import utf8_open, json_dumps
 
 DEFAULT_OUT_FMT = '.%s{}.pdf' % os.path.sep
 MAX_LEGEND_PER_COL = 20
@@ -119,7 +120,7 @@ class PlotSystems(object):
                  sort_by=None, at_most=None, limits=(0, 1),
                  out_fmt=DEFAULT_OUT_FMT, figsize=(8, 6), legend_ncol=None,
                  label_map=None, style_map=None, cmap=CMAP,
-                 run_code=None, interactive=False):
+                 run_code=None, interactive=False, anon=False):
         _optional_imports()
         if plt is None:
             raise ImportError('PlotSystems requires matplotlib to be installed')
@@ -167,6 +168,8 @@ class PlotSystems(object):
 
         if self.figures_by == 'single' and self.group_re and self.best_in_group in (False, True):
             raise ValueError('Single plot does not support grouping without --best-in-group')
+
+        self.anon = anon
 
     def _plot(self, ax, x, y, *args, **kwargs):
         # uses errorbars where appropriate
@@ -232,7 +235,7 @@ class PlotSystems(object):
             return {}
         return json.loads(s.split('/', 2)[-1])
 
-    def _plot1d(self, ax, data, group_sizes, tick_labels, score_label):
+    def _plot1d(self, ax, data, group_sizes, tick_labels, score_label, sys_label=None):
         small_font = make_small_font()
         ordinate = np.repeat(np.arange(len(group_sizes)), group_sizes)
         for scores, kwargs in data:
@@ -255,18 +258,22 @@ class PlotSystems(object):
             self._set_lim(plt.xlim)
             plt.ylim(-.5, len(tick_labels) - .5)
             plt.xlabel(score_label)
+            if sys_label is not None:
+                plt.ylabel(self._t(sys_label))
         elif self.secondary == 'columns':
             plt.xticks(ticks, tick_labels, fontproperties=small_font, **XTICK_ROTATION)
             plt.xlim(-.5, len(tick_labels) - .5)
             self._set_lim(plt.ylim)
             plt.ylabel(score_label)
+            if sys_label is not None:
+                plt.xlabel(self._t(sys_label))
         else:
             raise ValueError('Unexpected secondary: {!r}'.format(self.secondary))
         plt.tight_layout()
         if len(data) > 1:
             plt.legend(loc='best', prop=small_font, ncol=self._ncol(len(data)))
 
-    def _regroup(self, iterable, key, best_system=False, sort_by='name'):
+    def _regroup(self, iterable, key, best_system=False, sort_by='name', **kwargs):
         iterable = list(iterable)
         out = [(k, list(it)) for k, it in itertools.groupby(sorted(iterable, key=key), key=key)]
         if best_system == True:
@@ -307,7 +314,7 @@ class PlotSystems(object):
                                                                                       ('lo', float),
                                                                                       ('hi', float)])
             for system, sys_results in zip(self.systems, all_results):
-                result_dict = {entry['measure']: entry for entry in Confidence.read_tab_format(open(system))}
+                result_dict = {entry['measure']: entry for entry in Confidence.read_tab_format(utf8_open(system))}
                 # XXX: this is an ugly use of list comprehensions
                 mat = [[(result_dict[measure]['overall'][metric], 0 if self.confidence is None else result_dict[measure]['intervals'][metric][self.confidence][0], 0 if self.confidence is None else result_dict[measure]['intervals'][metric][self.confidence][1])
                         for metric in ('precision', 'recall', 'fscore')]
@@ -320,7 +327,7 @@ class PlotSystems(object):
         else:
             all_results = np.empty((len(self.systems), len(measures), 3), dtype=[('score', float)])
             for system, sys_results in zip(self.systems, all_results):
-                result_dict = Evaluate.read_tab_format(open(system))
+                result_dict = Evaluate.read_tab_format(utf8_open(system))
                 try:
                     sys_results[...] = [[(result_dict[measure][metric],) for metric in ('precision', 'recall', 'fscore')]
                                         for measure in measures]
@@ -381,16 +388,25 @@ class PlotSystems(object):
                                'sort_by': 'measure',}
             secondary_regroup = {'key': operator.attrgetter('group'),
                                  'best_system': self.best_in_group,
-                                 'sort_by': sort_by,}
+                                 'sort_by': sort_by,
+                                 'label': 'System',}
         elif self.figures_by == 'system':
             if sort_by == 'none':
                 sort_by = lambda results: self.measures.index(results[0].measure)
             primary_regroup = {'key': operator.attrgetter('group'),
-                               'best_system': self.best_in_group}
+                               'best_system': self.best_in_group,
+                               'label': 'System'}
             secondary_regroup = {'key': operator.attrgetter('measure'),
-                                 'sort_by': sort_by,}
+                                 'sort_by': sort_by,
+                                 'label': 'Measure',}
         else:
             raise ValueError('Unexpected figures_by: {!r}'.format(self.figures_by))
+
+        # HACK!
+        if self.anon:
+            for result in all_results:
+                self.label_map[result.group] = ''
+                self.label_map[result.system] = ''
 
         if self.interactive or self.run_code:
             figures = {}
@@ -405,15 +421,19 @@ class PlotSystems(object):
                 plt.close(figure)
 
         if self.run_code or self.interactive:
-            ns = {'figures': figures, 'results': all_results}
-            if self.run_code:
-                for code in self.run_code:
-                    # ns can be updated
-                    exec code in __builtins__, ns
-            if self.interactive:
-                embed_shell(ns, shell=None if self.interactive is True else self.interactive)
+            self._run_code(figures, all_results)
         else:
             return 'Saved to %s' % self.out_fmt.format('{%s}' % ','.join(figure_names))
+
+    def _run_code(self, figures, all_results):
+        ns = {'figures': figures, 'results': all_results}
+        if self.run_code:
+            for code in self.run_code:
+                # ns can be updated
+                exec(code, __builtins__, ns)
+        if self.interactive:
+            embed_shell(ns, shell=None if self.interactive is True else self.interactive)
+        return ns
 
     def _generate_figures(self, *args):
         if self.secondary == 'heatmap':
@@ -455,6 +475,10 @@ class PlotSystems(object):
                    fontproperties=small_font)
         plt.xticks(np.arange(len(column_names)), [self._t(name) for name in column_names],
                    fontproperties=small_font, **XTICK_ROTATION)
+        if 'label' in primary_regroup:
+            plt.ylabel(self._t(primary_regroup['label']))
+        if 'label' in secondary_regroup:
+            plt.xlabel(self._t(secondary_regroup['label']))
         ax.set_xlim(-.5, len(column_names) - .5)
         figure.colorbar(im)
         figure.tight_layout()
@@ -474,6 +498,7 @@ class PlotSystems(object):
 
         fig = plt.figure(figure_name, figsize=self.figsize)
         ax = fig.add_subplot(1, 1, 1)
+
         def _dict_mrg(*ds):
             out = {}
             for d in ds:
@@ -485,7 +510,7 @@ class PlotSystems(object):
                                 self._further_style(measure)))
                 for col, measure, color, marker
                 in zip(matrix, measure_names, colors, self._marker_cycle())]
-        self._plot1d(ax, data, np.ones(len(sys_names), dtype=int), sys_names, metric)
+        self._plot1d(ax, data, np.ones(len(sys_names), dtype=int), sys_names, metric, secondary_regroup.get('label'))
         plt.grid(axis='x' if self.secondary == 'rows' else 'y')
         return figure_name, fig, {}
 
@@ -523,7 +548,7 @@ class PlotSystems(object):
                 axis_label = '{} {}'.format(self._t(figure_name), self._t(axis_label))
 
                 self._plot1d(ax, [(scores[..., c], kwargs) for c, kwargs in self._metric_data()],
-                             [len(group) for group in figure_data], secondary_names, axis_label)
+                             [len(group) for group in figure_data], secondary_names, axis_label, secondary_regroup.get('label'))
 
             plt.grid(axis='x' if self.secondary == 'rows' else 'y')
             yield figure_name, fig, {}
@@ -615,6 +640,8 @@ class PlotSystems(object):
         p.add_argument('--label-map', help='JSON (or file) mapping internal labels to display labels')
         p.add_argument('--style-map', help='JSON (or file) mapping labels to <color>/<marker> settings')
 
+        p.add_argument('--anon', action='store_true', default=False, help='Hide system/team names')
+
         p.set_defaults(cls=cls)
         return p
 
@@ -633,7 +660,7 @@ class CompareMeasures(object):
         self.systems = systems
         if gold:
             assert not evaluation_files
-            self.gold = list(Reader(open(gold)))
+            self.gold = list(Reader(utf8_open(gold)))
         else:
             assert evaluation_files
             self.gold = None
@@ -652,7 +679,7 @@ class CompareMeasures(object):
         # TODO: parallelise?
         for system, sys_results in zip(self.systems, all_results):
             if self.gold is None:
-                result_dict = Evaluate.read_tab_format(open(system))
+                result_dict = Evaluate.read_tab_format(utf8_open(system))
             else:
                 result_dict = Evaluate(system, self.gold, measures=self.measures, fmt='none')()
             sys_results[...] = [result_dict[measure]['fscore'] for measure in self.measures]
@@ -692,7 +719,7 @@ class CompareMeasures(object):
         return "\n".join(fmt.format(*row) for row in rows)
 
     def json_format(self, results):
-        return json.dumps(results, sort_keys=True, indent=4)
+        return json_dumps(results)
 
     def no_format(self, results):
         return results
@@ -755,13 +782,20 @@ class CompareMeasures(object):
             plt.close(fig)
 
         fig, ax = plt.subplots(figsize=self.figsize)
-        ax.boxplot(all_results[:, ::-1], 0, 'rs', 0,
+        ax.boxplot(all_results[:, ::-1], notch=False, sym='rs', vert=False,
                    labels=disp_measures[::-1])
         plt.yticks(fontproperties=small_font)
         plt.tight_layout()
         plt.savefig(self.out_fmt.format('spread'))
 
-        return 'Saved to %s' % self.out_fmt.format('{pearson,spearman,kendall,spread}')
+        fig, ax = plt.subplots(figsize=self.figsize)
+        ax.violinplot(all_results[:, ::-1], vert=False, showmedians=True)
+        plt.yticks(range(1, 1 + len(disp_measures)), disp_measures[::-1], fontproperties=small_font)
+        plt.tight_layout()
+        plt.ylim(0, 1 + len(disp_measures))
+        plt.savefig(self.out_fmt.format('violin'))
+
+        return 'Saved to %s' % self.out_fmt.format('{pearson,spearman,kendall,spread,violin}')
 
 
     FMTS = {
@@ -825,18 +859,21 @@ class ComposeMeasures(object):
                     basename, ext = os.path.splitext(basename)
                 out_path = self.out_fmt.format(dir=dirname, base=basename, ext=ext)
 
-            with open(path) as in_file:
+            with utf8_open(path) as in_file:
                 result = self._process_system(in_file)
             with open(out_path, 'w') as out_file:
                 print(result, file=out_file)
 
     def _process_system(self, in_file):
         # TODO: don't be so implicit about header
+        output_names = set('{}/{}'.format(m1, m2) for m1, m2 in self.ratios)
+
         out = []
         lookup = {}
         for l in in_file:
             l = l.rstrip().split('\t')
-            out.append(l)
+            if l[-1] not in output_names:
+                out.append(l)
             lookup[l[-1]] = l[:-1]
         for m1, m2 in self.ratios:
             row = []
@@ -896,7 +933,7 @@ class RankSystems(object):
         short_names = _get_system_names(self.systems)
         for path, short in zip(self.systems, short_names):
             #print('opening', path, file=sys.stderr)
-            results = Evaluate.read_tab_format(open(path))
+            results = Evaluate.read_tab_format(utf8_open(path))
             system = short if self.short_names else path
             tuples.extend(Tup(system, _group(self.group_re, path), measure, metric, score)
                           for measure, measure_results in results.items() if measure in measures

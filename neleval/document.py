@@ -6,8 +6,10 @@ from __future__ import print_function
 from collections import OrderedDict
 import warnings
 import sys
+import argparse
 
 from .annotation import Annotation
+from .utils import unicode
 
 TEMPLATE = u'{}\t{}\t{}\t{}\t{}'
 ENC = 'utf8'
@@ -25,7 +27,7 @@ class Document(object):
     # May be 'ignore', 'warn', 'error'
     VALIDATION = {
         'nested': 'ignore',
-        'crossing': 'warn',
+        'crossing': 'ignore',
         'duplicate': 'ignore',
     }
 
@@ -52,16 +54,12 @@ class Document(object):
                 continue
             if self.VALIDATION[issue] == 'error':
                 b, a = instances[0]
-                raise ValueError('Found annotations with {} span:\n{}\n{}'
-                                 .format(issue,
-                                         unicode(a).encode(ENC),
-                                         unicode(b).encode(ENC)))
+                raise ValueError(u'Found annotations with {} span:\n{}\n{}'
+                                 .format(issue, unicode(a), unicode(b)))
             elif self.VALIDATION[issue] == 'warn':
                 b, a = instances[0]
-                warnings.warn('Found annotations with {} span:\n{}\n{}'
-                              .format(issue,
-                                      unicode(a).encode(ENC),
-                                      unicode(b).encode(ENC)))
+                warnings.warn(u'Found annotations with {} span:\n{}\n{}'
+                              .format(issue, unicode(a), unicode(b)))
 
     def _set_fields(self):
         """Set fields on annotations that are relative to document"""
@@ -107,7 +105,7 @@ def by_document(annotations):
             d[a.docid].append(a)
         else:
             d[a.docid] = [a]
-    return d.iteritems()
+    return d.items()
 
 
 def by_mention(annotations):
@@ -138,4 +136,34 @@ class Reader(object):
     def annotations(self):
         "Yield Annotation objects"
         for line in self.fh:
-            yield Annotation.from_string(line.rstrip('\n').decode(ENC))
+            yield Annotation.from_string(line.rstrip('\n'))
+
+
+class ValidateSpans(object):
+    """Identify duplicate, crossing and nested spans
+
+    Will output warnings or errors as determined by options.
+    """
+    def __init__(self, system, duplicate='error', crossing='warn', nested='ignore'):
+        self.system = system
+        self.duplicate = duplicate
+        self.crossing = crossing
+        self.nested = nested
+
+    def __call__(self):
+        # HACK (not concurrency-safe)
+        OLD_VALIDATION = Document.VALIDATION
+        Document.VALIDATION = {k: getattr(self, k)
+                               for k in OLD_VALIDATION}
+        list(Reader(self.system))
+        Document.VALIDATION = OLD_VALIDATION
+
+    @classmethod
+    def add_arguments(cls, p):
+        CHOICES = ['ignore', 'warn', 'error']
+        p.add_argument('system', nargs='?', default=sys.stdin, type=argparse.FileType('r'), metavar='FILE')
+        p.add_argument('--duplicate', default='error', choices=CHOICES)
+        p.add_argument('--crossing', default='warn', choices=CHOICES)
+        p.add_argument('--nested', default='ignore', choices=CHOICES)
+        p.set_defaults(cls=cls)
+        return p
